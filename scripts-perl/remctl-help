@@ -1,0 +1,152 @@
+#!/usr/bin/env python
+
+from os import listdir
+from os.path import isfile, join
+
+import argparse
+import re
+import subprocess
+import sys
+
+
+# ------------------------------------------------------------------------
+# Display the POD from the end of this file
+
+def display_pod():
+    subprocess.call(['/usr/bin/pod2text', sys.argv[0]])
+    return
+
+
+# ------------------------------------------------------------------------
+def read_remctl_conf(this_path):
+
+    file_list = [f for f in listdir(this_path) if isfile(join(this_path, f))]
+
+    # Read the configuration files and unfold the command defintions.
+    continued_pattern = re.compile('(.*?)\\\s*$')
+    remark_pattern = re.compile('^\s*#')
+    remctl_lines = []
+    for conf_file in file_list:
+        conf_path = this_path + conf_file
+        f = open(conf_path, 'r')
+        continued = False
+        unfolded_line = ''
+        for line in f:
+            if remark_pattern.match(line):
+                continue
+            this_line = line.strip()
+            if continued_pattern.search(this_line):
+                m = continued_pattern.search(this_line)
+                if len(unfolded_line) > 0:
+                    unfolded_line += ' '
+                unfolded_line += m.group(1).strip()
+                continued = True
+                continue
+            if len(unfolded_line)>0:
+                unfolded_line += ' ' + this_line
+                remctl_lines.append(unfolded_line)
+                unfolded_line = ''
+                continue
+            remctl_lines.append(this_line)
+        if unfolded_line:
+            remctl_lines.append(unfolded_line)
+        f.close()
+
+    # Pull a list of help commands from the configuration lines using
+    # a dictionary to eliminate duplicates.
+    prog_list = {}
+    for l_raw in remctl_lines:
+        l = re.sub('\s\s+', ' ', l_raw).strip()
+        toks = l.split(' ')
+        if len(toks) > 2:
+            cmd = toks[0]
+            sub_cmd = toks[1]
+            cmd_exe = toks[2]
+            if sub_cmd == 'ALL' or sub_cmd == 'help':
+                if isfile(cmd_exe):
+                    prog_list[cmd] = cmd_exe
+
+    return prog_list
+
+
+# ------------------------------------------------------------------------
+# Run help commands
+
+def display_verbose(prog_list):
+    for cmd, script in sorted(prog_list.items()):
+        proc = subprocess.Popen([script, 'help'], stdout=subprocess.PIPE)
+        tmp = proc.stdout.read()
+        print('---------------------------------------------------')
+        print('remctl Command: {}'.format(cmd))
+        print('')
+        print(tmp)
+    return
+
+# ------------------------------------------------------------------------
+# Just display help command
+
+def display_help(prog_list):
+    print('Available commands:')
+    print('')
+    for cmd, script in sorted(prog_list.items()):
+        print('    {}'.format(cmd))
+    print('')
+    return
+
+
+##############################################################################
+# Main Routine
+##############################################################################
+
+# Command line arguments
+parser = argparse.ArgumentParser(
+    description='Tool for display available remctl commands')
+parser.add_argument('help', nargs='?', default = None, help = 'Script usage')
+parser.add_argument('--manual',
+                    action = 'store_true',
+                    help = 'Documentation for help script')
+parser.add_argument('--verbose',
+                    action = 'store_true',
+                    help = 'Display extended remctl help')
+args = parser.parse_args()
+if args.manual:
+    print(display_pod())
+    sys.exit(0)
+
+prog_path = '/etc/remctl/conf.d/'
+prog_list = read_remctl_conf(prog_path)
+
+if args.verbose:
+    display_verbose(prog_list)
+else:
+    display_help(prog_list)
+
+sys.exit()
+
+doc = '''
+
+=head1 NAME
+
+remctl_help
+
+=head1 SYNOPSIS
+
+remctl_help
+
+=head1 DESCRIPTION
+
+This script reads all of the files in /etc/remctl/conf.d, extracts
+the commands that have a subcommand of 'ALL' or 'help', and executes
+the script with an argument of 'help'.  The script displays help for
+all commands whether or not the user has access to run the command.
+
+=head1 AUTHOR
+
+Bill MacAllister <whm@stanford.edu>
+
+=head1 COPYRIGHT
+
+Copyright 2016 Dropbox
+
+=cut
+'''
