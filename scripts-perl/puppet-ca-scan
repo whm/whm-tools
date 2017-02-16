@@ -1,0 +1,507 @@
+#!/usr/bin/perl
+#
+# Scan pending puppetca certificate requests
+
+use Carp;
+use Email::MIME;
+use Email::Sender::Simple qw(sendmail);
+use Env qw(REMCTL_COMMAND);
+use Getopt::Long;
+use IPC::Run qw( run timeout );
+use Pod::Usage;
+use POSIX ();
+use strict;
+use Sys::Hostname;
+
+my $DEBUG_TIME;
+my $DEFAULT_DAYS = 30;
+my $CERT_DIR     = '/var/lib/puppet/ssl/ca/signed';
+my $CSR_ROOT     = '/var/lib/puppet/ssl/ca/requests';
+
+my $opt_alt_dns;
+my $opt_days;
+my $opt_debug;
+my $opt_delete;
+my $opt_help;
+my $opt_mail;
+my $opt_manual;
+
+#################################################################
+# Subroutines
+#################################################################
+
+# Display debugging messages
+sub dbg {
+    my ($tmp)   = @_;
+    my $now     = time();
+    my $elapsed = $now - $DEBUG_TIME;
+    print {*STDOUT} "$now ($elapsed) $tmp \n"
+      or croak("debugging print to STDOUT failed: $!");
+    $DEBUG_TIME = $now;
+    return;
+}
+
+# Print to STDOUT and trap any errors
+sub msg {
+    my ($tmp) = @_;
+    print {*STDOUT} $tmp;
+    return;
+}
+
+# Display a more complete usage command
+sub display_help {
+    my ($cmd_name) = @_;
+    msg("$cmd_name - Manage Puppet Certificates\n");
+    msg("\n");
+    msg("  Display CSRs and Find Certificates:\n");
+    msg("    $cmd_name list                 - List unsigned CSRs\n");
+    msg("    $cmd_name find [name fragment] - Find a certificate\n");
+    msg("    $cmd_name pending              - Native pending CSRs\n");
+    msg("    $cmd_name all                  - Native certificate list\n");
+    msg("\n");
+    msg("  Siging CSRs:\n");
+    msg("    $cmd_name sign <certificate subject>\n");
+    msg("    $cmd_name sign --allow-dns-alt-names <certificate subject>\n");
+    msg("\n");
+    msg("  Removing Certificates and Deleting CSRs:\n");
+    msg("    $cmd_name clean <certificate subject> - Revoke cert\n");
+    msg("    $cmd_name delete <certificate subject> [--days=n]\n");
+    msg("\n");
+    msg("  Getting Help:\n");
+    msg("    $cmd_name help\n");
+    msg("    $cmd_name manual\n");
+    return;
+}
+
+# Run a shell command
+sub run_cmd {
+    my @cmd = @_;
+    my $in;
+    my $out;
+    my $err;
+    my $err_msg;
+    my $err_no;
+    eval {
+        run \@cmd, \$in, \$out, \$err, timeout(120);
+        if ($?) {
+            $err_no = $?;
+        }
+    };
+    if ($@) {
+        $err_msg .= "ERROR ($err_no): $@\n";
+        dbg('cmd:' . join(' ', @cmd));
+        dbg('err:' . $err);
+        dbg('out:' . $out);
+        die $err_msg;
+    }
+    if ($opt_debug) {
+        dbg('cmd:' . join(' ', @cmd));
+        dbg('err:' . $err);
+        dbg('out:' . $out);
+    } else {
+        if ($err) {
+            dbg('cmd:' . join(' ', @cmd));
+            dbg('err:' . $err);
+            dbg('out:' . $out);
+        }
+    }
+    return $out;
+}
+
+# Dislay active certificates, i.e. certificates that have been
+# signed.
+
+sub display_active {
+    my ($fragment) = @_;
+
+    my @file_list = ();
+    my $dh;
+    opendir($dh, $CERT_DIR);
+    @file_list = grep { !/^\.+$/ } readdir($dh);
+    closedir($dh);
+
+    my %display_list = ();
+    for my $f (@file_list) {
+        if ($fragment && $f !~ /$fragment/xms) {
+            next;
+        }
+        my $file_path = "$CERT_DIR/$f";
+        my $mtime     = (stat($file_path))[9];
+        my $this_age  = (time() - $mtime) / 86400;
+        if ($opt_debug) {
+            dbg("f:$f mtime:$mtime this_age:$this_age");
+        }
+        my $display_date = POSIX::strftime("%Y-%m-%d", localtime($mtime));
+        my $cert = $f;
+        $cert =~ s/[.]pem$//xms;
+        my $m = sprintf "%4i %s %s", $this_age, $display_date, $cert;
+        $display_list{$m}++;
+        if ($opt_debug) {
+            msg("$m\n");
+        }
+    }
+
+    # Display the results sorted
+    for my $line (sort keys %display_list) {
+        msg("$line\n");
+    }
+
+    return;
+}
+
+# Display outstanding CSRs older than n days
+sub display_selected {
+    my @in_list = @_;
+
+    # Set the cutoff time
+    my $cutoff_days;
+    if ($opt_days) {
+        $cutoff_days = $opt_days;
+    } else {
+        $cutoff_days = $DEFAULT_DAYS;
+    }
+    my $cutoff = time() - ($cutoff_days * 86400);
+
+    # Set display all if --days is not specified
+    my $display_all;
+    if (!$opt_days) {
+        $display_all = 1;
+    } else {
+        $display_all = 0;
+    }
+
+    # Get a file list
+    my %display_list = ();
+    my @file_list;
+    if (scalar(@in_list) > 0) {
+        for my $f (@in_list) {
+            if ($f !~ /[.]pem$/xms) {
+                $f .= '.pem';
+            }
+            my $path = "$CSR_ROOT/$f";
+            if (-e $path) {
+                push @file_list, $f;
+            } else {
+                msg("WARN: file not found $path\n");
+            }
+        }
+    } else {
+        my $dh;
+        opendir($dh, $CSR_ROOT);
+        @file_list = grep { !/^\.+$/ } readdir($dh);
+        closedir($dh);
+    }
+
+    my @return_list = ();
+    for my $f (@file_list) {
+        my $file_path = "$CSR_ROOT/$f";
+        my $mtime     = (stat($file_path))[9];
+        my $this_age  = (time() - $mtime) / 86400;
+        if ($opt_debug) {
+            dbg("f:$f mtime:$mtime this_age:$this_age");
+        }
+        if ($display_all || ($this_age > $opt_days)) {
+            push @return_list, $f;
+            my $display_date = POSIX::strftime("%Y-%m-%d", localtime($mtime));
+            my $cert = $f;
+            $cert =~ s/[.]pem$//xms;
+            my $m = sprintf "%4i %s %s", $this_age, $display_date, $cert;
+            $display_list{$m}++;
+            if ($opt_debug) {
+                msg("$m\n");
+            }
+        }
+    }
+
+    # Display the results sorted
+    for my $line (sort keys %display_list) {
+        msg("$line\n");
+    }
+
+    # Mail the results if requested
+    if ($opt_mail && scalar(@return_list) > 0) {
+        my $msg;
+        for my $line (sort keys %display_list) {
+            $msg .= "$line\n";
+        }
+        my $subj      = 'Old Puppet CSRs on ' . hostname;
+        my $email_msg = Email::MIME->create(
+            header_str => [
+                From    => 'root@' . hostname,
+                To      => $opt_mail,
+                Subject => 'Old Puppet CSRs on ' . hostname,
+            ],
+            attributes => {
+                encoding => 'quoted-printable',
+                charset  => 'ISO-8859-1',
+            },
+            body_str => $msg,
+        );
+        sendmail($email_msg);
+    }
+
+    return @return_list;
+}
+
+# Display all certificates using the native puppet command.
+sub list_all_certs {
+    my @cmd = ('/usr/bin/puppet', 'cert', 'list', '--all');
+    my $m = run_cmd(@cmd);
+    msg("$m\n");
+    return;
+}
+
+# Display pending CSRs using the native puppet command.
+sub list_pending {
+    my @cmd = ('/usr/bin/puppet', 'cert', 'list');
+    my $m = run_cmd(@cmd);
+    msg("$m\n");
+    return;
+}
+
+# Sign pending CSRs
+sub sign_files {
+    my @file_list = @_;
+    for my $f (@file_list) {
+        my $path = "$CSR_ROOT/$f";
+        if (!-e $path) {
+            msg("WARN: file not found $f\n");
+            next;
+        }
+        my @cmd = ('/usr/bin/puppet', 'cert');
+        if ($opt_alt_dns) {
+            push @cmd, '--allow-dns-alt-names';
+        }
+        push @cmd, 'sign';
+        my $cert = $f;
+        $cert =~ s/[.]pem$//xms;
+        push @cmd, $cert;
+        my $m = run_cmd(@cmd);
+        msg("$m\n");
+    }
+    return;
+}
+
+# Clean certificates using the native puppet command
+sub clean_certs {
+    my @file_list = @_;
+    for my $f (@file_list) {
+        my @cmd = ('/usr/bin/puppet', 'cert', 'clean');
+        my $cert = $f;
+        $cert =~ s/[.]pem$//xms;
+        push @cmd, $cert;
+        my $m = run_cmd(@cmd);
+        msg("$m\n");
+    }
+    return;
+}
+
+# Delete pending CSRs
+sub delete_files {
+    my @file_list = @_;
+    for my $f (@file_list) {
+        my $path = "$CSR_ROOT/$f";
+        if (-e $path) {
+            unlink $path
+              or croak "ERROR: deleting $path $!\n";
+            msg("INFO: deleting $path\n");
+        } else {
+            msg("WARN: file not found $f\n");
+        }
+    }
+    return;
+}
+#################################################################
+# Main Routine
+#################################################################
+
+GetOptions(
+    'allow-dns-alt-names' => \$opt_alt_dns,
+    'days=i'              => \$opt_days,
+    'debug'               => \$opt_debug,
+    'delete'              => \$opt_delete,
+    'help'                => \$opt_help,
+    'mail=s'              => \$opt_mail,
+    'manual'              => \$opt_manual
+);
+
+# Flush output immediately
+local $| = 1;
+
+# Set the command name
+my $cmd_name;
+if ($REMCTL_COMMAND) {
+    $cmd_name = $REMCTL_COMMAND;
+} else {
+    my $cmd_name = $0;
+    $cmd_name =~ s{.*/}{}xmsg;
+}
+
+# Handle command line specifications
+my $action = shift;
+if (!$action) {
+    if ($opt_delete) {
+        $action = 'delete';
+    } else {
+        $action = 'list';
+    }
+}
+
+# Display help if requested
+if ($opt_help) {
+    pod2usage(-verbose => 0);
+}
+if ($opt_manual || $action eq 'manual') {
+    pod2usage(-verbose => 2);
+}
+
+# Handle the requested action
+if ($action eq 'help') {
+    display_help($cmd_name);
+    exit 0;
+} elsif ($action eq 'find') {
+    if ($ARGV[1]) {
+        msg("ERROR: only one fragment allowed\n");
+        exit 1;
+    }
+    display_active($ARGV[0]);
+} elsif ($action eq 'list') {
+    display_selected(@ARGV);
+} elsif ($action eq 'all') {
+    list_all_certs();
+} elsif ($action eq 'pending') {
+    list_pending();
+} elsif ($action eq 'clean') {
+    if (!@ARGV) {
+        msg('ERROR: a certificate subject is required');
+        exit 1;
+    }
+    clean_certs(@ARGV);
+} elsif ($action eq 'sign') {
+    if (!@ARGV) {
+        msg('ERROR: a certificate subject is required');
+        exit 1;
+    }
+    my @files = display_selected(@ARGV);
+    sign_files(@files);
+} elsif ($action eq 'delete') {
+    if (!@ARGV && !$opt_days) {
+        msg('ERROR: either a certificate subject or --days is required');
+        exit 1;
+    }
+    my @files = display_selected(@ARGV);
+    delete_files(@files);
+} else {
+    print "ERROR: unknown action ($action)\b";
+    pod2usage(-verbose => 0);
+}
+
+exit;
+
+__END__
+
+=head1 NAME
+
+puppet-ca-scan
+
+=head1 SYNOPSIS
+
+puppet-ca-scan find|list|all|pending|delete|clean|sign|help|manual [args]
+
+=head1 DESCRIPTION
+
+The primary function of this script is to manage puppet CSRs.  The
+script can scan all outstanding Puppet CSRs.  The default action is to
+display the outstanding CSRs.  Optionally CSRs can be signed or
+deleted.
+
+Additionally, this script can be used to search the directory holding
+signed certificates using the find action.  This is generally much
+faster than using the 'puppet cert list' command because it selects
+based on the file name alone.
+
+=head1 ACTION
+
+=over 4
+
+=item find [subject fragment]
+
+Search for a puppet certificate by file name.  This is generally faster
+that the 'puppet cert list' command which examines the subject names
+embedded in the certificate files.  If no fragment is supplied then
+all certificates are listed.
+
+=item --allow-dns-alt-names
+
+Allow certificates with alternate DNS names.  The default is to disallow
+alternate DNS names.
+
+=item list [--days=n]
+
+Lists CSRs that have not been signed.  This searches the CSR files and
+is faster than 'puppet ca list'.
+
+=item all
+
+List all certificates using the 'puppet cert list' command.
+
+=item delete --days=n
+
+Deletes outstanding, i.e. unsigned, certifcates that are over n days
+old.
+
+=item clean <certificate subject>
+
+Removes a certificate from puppet.  This action calls the 'puppet cert
+clean' command.
+
+=item sign <certificate subject>
+
+Signs a CSR.  This action calls the 'puppet cert sign' command.
+
+=item help
+
+Display short help message.
+
+=item manual
+
+Display this documentation.
+
+=back
+
+=head1 OPTIONS
+
+=over 4
+
+=item --days=n
+
+CSRs must be at least n days old to be selected.
+
+=item --mail=rfc822
+
+Send a report of any CSRs selected to the specified address.  If no
+files are selected no mail is sent.
+
+=item --debug
+
+Display debugging messages.
+
+=item --help
+
+Display short help message.
+
+=item --manual
+
+Display this documentation.
+
+=back
+
+=head1 AUTHOR
+
+Bill MacAllister <whm@dropbox.com>
+
+=head1 COPYRIGHT
+
+Copyright 2015,2016 Dropbox
+
+=cut

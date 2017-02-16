@@ -1,0 +1,166 @@
+#!/bin/bash
+#
+# File: /usr/sbin/remctl-puppet-agent
+
+function help_display {
+    echo "Valid commands:"
+    echo ""
+    echo "  puppet run       - executes puppet"
+    echo "  puppet noop      - executes puppet with --noop"
+    echo "  puppet facts     - display puppet facts"
+    echo "  puppet lock      - disables puppet"
+    echo "  puppet unlock    - enables puppet"
+    echo "  puppet status    - shows puppet lock status"
+    echo "  puppet clean     - deletes all puppet certificates"
+    echo "  puppet showcerts - deletes all puppet certificates"
+    echo "  puppet help      - displays this help text"
+    echo "  puppet manual    - displays documentation"
+    exit 1
+}
+
+##############################################################################
+# Main Routine
+##############################################################################
+
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+run_lock=/var/lib/puppet/state/agent_catalog_run.lock
+disabled_lock=/var/lib/puppet/state/agent_disabled.lock
+
+# This addresses a problem with Puppet's handling of init scripts that
+# contain non-ASCII characters.
+this_lang=`locale -a | grep -i C.UTF`
+if [ $this_lang = "" ]
+then
+    this_lang=`locale -a | grep -i en_US.utf`
+fi
+if [ ! $this_lang = "" ]
+then
+    export LANG=$this_lang
+    export LC_ALL=$this_lang
+fi
+
+action=$1
+
+case $action in
+    run)
+        /usr/bin/puppet agent --test
+        ;;
+    noop)
+        /usr/bin/puppet agent --test --noop
+        ;;
+    lock)
+        /usr/bin/puppet agent --disable
+        ;;
+    unlock)
+        /usr/bin/puppet agent --enable
+        ;;
+    status)
+        if [ -e $run_lock ]
+        then
+            echo "Puppet is RUNNING."
+        else
+            if [ -e $disabled_lock ]
+            then
+                echo "Puppet is LOCKED."
+                s=`cat $disabled_lock`
+                echo $s
+            else
+                echo "Puppet is not locked."
+            fi
+        fi
+        ;;
+    facts)
+        /usr/bin/facter -p
+        ;;
+    showcerts)
+        /usr/bin/find /var/lib/puppet -name "*.pem"
+        ;;
+    clean)
+        /usr/bin/find /var/lib/puppet -name "*.pem" -delete
+        ;;
+    help)
+        help_display
+        ;;
+    manual)
+        /usr/bin/pod2text $0
+        exit 1
+        ;;
+    *)
+        echo "ERROR: unknown command ($1)"
+        help_display
+        ;;
+esac
+
+# Documentation.  Use a hack to hide this from the shell.  Because of
+# the above exit line, this should never be executed.
+DOCS=<<__END_OF_DOCS__
+
+=head1 NAME
+
+remctl-puppet-agent
+
+=head1 SYNOPSIS
+
+remctl-puppet-agent <valid action>
+
+=head1 DESCRIPTION
+
+This script is a wrapper around the 'puppet agent' command that is
+intended to be called by remctl.  The actual script name is
+remctl-puppet-agent.  Most likely the the remctl command will be
+'puppet', but it does have to be depending on the remctl
+configuration.
+
+=head1 ACTIONS
+
+=over 4
+
+=item run
+
+Executes 'puppet agent --test'.
+
+=item noop
+
+Executes 'puppet agent --test --noop'.
+
+=item facts
+
+Executes 'facter -p'.
+
+=item lock
+
+Disables puppet executions with the command 'puppet agent --disable'.
+
+=item unlock
+
+Enables puppet executions with the command 'puppet agent --enable'.
+
+=item status
+
+Displays the current puppet lock status.
+
+=item clean
+
+Deletes all files in the /var/lib/puppet tree that end in ".pem".
+
+=item showcerts
+
+List the current puppet certs in the /var/lib/puppet directory tree.
+
+=item help
+
+Displays short usage message.
+
+=item manual
+
+Display this documentation.
+
+=back
+
+=head1 AUTHORS
+
+Bill MacAllister <whm@dropbox.com>
+
+=cut
+
+__END_OF_DOCS__
